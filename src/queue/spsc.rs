@@ -71,6 +71,13 @@ pub fn bounded<T: Send>(size: u32) -> (BSender<T>, BReceiver<T>) {
     (BSender::new(queue.clone()), BReceiver::new(queue))
 }
 
+/// Same as [`bounded`], but the ring has already turned `lap / 2` times.
+#[cfg(test)]
+pub(crate) fn bounded_at_lap<T: Send>(size: u32, lap: u32) -> (BSender<T>, BReceiver<T>) {
+    let queue = Arc::new(UnsafeCell::new(SpscBounded::starting_at_lap(size, lap)));
+    (BSender::new(queue.clone()), BReceiver::new(queue))
+}
+
 /// The sending side of a queue.
 ///
 /// # Examples
@@ -791,6 +798,38 @@ mod test {
         std::thread::sleep(std::time::Duration::from_millis(1000));
         tx_u.close();
         thread.join().unwrap();
+    }
+
+    #[test]
+    fn try_send_reports_full_when_lap_wraps() {
+        // Writer lap u32::MAX - 1 is the last turn before the lap wraps around u32. Filling
+        // the ring on that turn leaves the slot laps at u32::MAX while the writer lap wraps to 0.
+        let (tx, rx) = crate::queue::spsc::bounded_at_lap::<u32>(2, u32::MAX - 1);
+        tx.try_send(1).unwrap();
+        tx.try_send(2).unwrap();
+
+        // try_send used to spin here until a receiver made room, instead of returning Full.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let tx_t = tx.clone();
+        let thread = std::thread::spawn(move || {
+            let full = matches!(tx_t.try_send(3), Err(crate::error::TrySendError::Full(3)));
+            done_tx.send(full).unwrap();
+        });
+        let result = done_rx.recv_timeout(std::time::Duration::from_secs(5));
+        if result.is_err() {
+            // Let the spinning try_send finish, so the test fails instead of hanging.
+            let _ = rx.try_recv();
+        }
+        thread.join().unwrap();
+        assert_eq!(result, Ok(true), "try_send on a full queue must return Full at once");
+
+        // The queue keeps working after the wrap.
+        assert_eq!(rx.try_recv(), Ok(1));
+        assert_eq!(rx.try_recv(), Ok(2));
+        for i in 10..20 {
+            tx.try_send(i).unwrap();
+            assert_eq!(rx.try_recv(), Ok(i));
+        }
     }
 
     #[test]

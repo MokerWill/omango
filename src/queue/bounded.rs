@@ -43,8 +43,17 @@ use crate::{
 };
 
 const RETRIES: u8 = 2;
-const MPMC_MASK_32: u32 = 1 << 31;
-const MPMC_MASK_64: u64 = 1 << 63;
+/// Closed flag of `MpmcBounded::write_meta`: the top bit of the index half. Indexes are
+/// below 2^30 (`cap <= 1 << 30`), so this bit is never part of an index, and the lap in
+/// the upper half can use all 32 bits.
+const MPMC_CLOSED: u64 = 1 << 31;
+
+/// Orders the lap a thread expects against the lap stored in a slot. Laps wrap around
+/// `u32`, so they are compared by their wrapping difference, not by value.
+#[inline(always)]
+fn cmp_lap(lap: u32, elem_lap: u32) -> std::cmp::Ordering {
+    (lap.wrapping_sub(elem_lap) as i32).cmp(&0)
+}
 
 pub(crate) trait Bounded<T> {
     /// Sends non-blocking a message.
@@ -223,6 +232,20 @@ impl<T> SpscBounded<T> {
             capacity: raw_cap,
         }
     }
+
+    /// Creates an empty queue whose writer is at the start of lap `lap` (even), as if the
+    /// ring had already turned `lap / 2` times.
+    #[cfg(test)]
+    pub(crate) fn starting_at_lap(cap: u32, lap: u32) -> Self {
+        assert_eq!(lap % 2, 0, "writer laps are even");
+        let mut queue = Self::new(cap);
+        for elem in queue.buffer.iter_mut() {
+            elem.set_lap(lap);
+        }
+        queue.meta.write_meta = (lap as u64) << 32;
+        *queue.read_meta = (lap.wrapping_add(1) as u64) << 32;
+        queue
+    }
 }
 
 impl<T> Bounded<T> for SpscBounded<T> {
@@ -257,7 +280,7 @@ impl<T> Bounded<T> for SpscBounded<T> {
             }
 
             let elem_lap = elem.load_lap();
-            match lap.cmp(&elem_lap) {
+            match cmp_lap(lap, elem_lap) {
                 std::cmp::Ordering::Equal => {
                     // The element is ready for writing on this lap.
                     // Try to claim the right to write to this element.
@@ -270,7 +293,7 @@ impl<T> Bounded<T> for SpscBounded<T> {
                 },
                 std::cmp::Ordering::Greater => {
                     // The element is not yet read on the previous lap.
-                    if lap > elem.load_lap() {
+                    if cmp_lap(lap, elem.load_lap()) == std::cmp::Ordering::Greater {
                         return (elem, elem_lap, State::Failed);
                     }
                     // The element has already been read on this lap;
@@ -295,7 +318,7 @@ impl<T> Bounded<T> for SpscBounded<T> {
 
         loop {
             let elem_lap = elem.load_lap();
-            match lap.cmp(&elem_lap) {
+            match cmp_lap(lap, elem_lap) {
                 std::cmp::Ordering::Equal => {
                     // The element is ready for reading on this lap.
                     // Try to claim the right to read to this element.
@@ -309,7 +332,7 @@ impl<T> Bounded<T> for SpscBounded<T> {
                 },
                 std::cmp::Ordering::Greater => {
                     // The element is not yet written on the previous lap.
-                    if lap > elem.load_lap() {
+                    if cmp_lap(lap, elem.load_lap()) == std::cmp::Ordering::Greater {
                         return (elem, elem_lap, false);
                     }
                     // The element has already been written on this lap;
@@ -407,6 +430,20 @@ impl<T> MpmcBounded<T> {
         }
     }
 
+    /// Creates an empty queue whose writer is at the start of lap `lap` (even), as if the
+    /// ring had already turned `lap / 2` times.
+    #[cfg(test)]
+    pub(crate) fn starting_at_lap(cap: u32, lap: u32) -> Self {
+        assert_eq!(lap % 2, 0, "writer laps are even");
+        let mut queue = Self::new(cap);
+        for elem in queue.buffer.iter_mut() {
+            elem.set_lap(lap);
+        }
+        *queue.write_meta.get_mut() = (lap as u64) << 32;
+        *queue.read_meta.get_mut() = (lap.wrapping_add(1) as u64) << 32;
+        queue
+    }
+
     #[inline(always)]
     pub(crate) fn get_cap(&self) -> u32 {
         self.capacity
@@ -416,7 +453,7 @@ impl<T> MpmcBounded<T> {
 impl<T> Bounded<T> for MpmcBounded<T> {
     fn close(&self) {
         let mut meta = self.write_meta.load(Ordering::Acquire);
-        if (meta & MPMC_MASK_64) != 0 {
+        if (meta & MPMC_CLOSED) != 0 {
             return;
         }
 
@@ -424,7 +461,7 @@ impl<T> Bounded<T> for MpmcBounded<T> {
         let backoff = Backoff::default();
 
         loop {
-            new_meta = meta | MPMC_MASK_64;
+            new_meta = meta | MPMC_CLOSED;
             match self.write_meta.compare_exchange_weak(
                 meta,
                 new_meta,
@@ -446,7 +483,7 @@ impl<T> Bounded<T> for MpmcBounded<T> {
     #[inline(always)]
     fn length(&self) -> u32 {
         let head = self.read_meta.load(Ordering::Relaxed) as u32;
-        let tail = self.write_meta.load(Ordering::Relaxed) as u32;
+        let tail = (self.write_meta.load(Ordering::Relaxed) & !MPMC_CLOSED) as u32;
         if tail > head {
             return tail - head + 1;
         }
@@ -458,16 +495,17 @@ impl<T> Bounded<T> for MpmcBounded<T> {
         let backoff = Backoff::default();
 
         loop {
+            // Checked before the index is used: with the flag set, `meta as u32` is not an index.
+            if unlikely((meta & MPMC_CLOSED) != 0) {
+                return (unsafe { self.buffer.get_unchecked(0) }, 0, State::Closed);
+            }
+
             let idx = meta as u32;
             let lap = (meta >> 32) as u32;
             let elem = unsafe { self.buffer.get_unchecked(idx as usize) };
 
-            if unlikely(lap >= MPMC_MASK_32) {
-                return (elem, 0, State::Closed);
-            }
-
             let elem_lap = elem.load_lap();
-            match lap.cmp(&elem_lap) {
+            match cmp_lap(lap, elem_lap) {
                 std::cmp::Ordering::Equal => {
                     // The element is ready for writing on this lap.
                     // Try to claim the right to write to this element.
@@ -492,7 +530,7 @@ impl<T> Bounded<T> for MpmcBounded<T> {
                 },
                 std::cmp::Ordering::Greater => {
                     // The element is not yet read on the previous lap.
-                    if lap > elem.load_lap() {
+                    if cmp_lap(lap, elem.load_lap()) == std::cmp::Ordering::Greater {
                         return (elem, elem_lap, State::Failed);
                     }
                     // The element has already been read on this lap;
@@ -524,7 +562,7 @@ impl<T> Bounded<T> for MpmcBounded<T> {
             let elem = unsafe { self.buffer.get_unchecked(idx as usize) };
             let elem_lap = elem.load_lap();
             
-            match lap.cmp(&elem_lap) {
+            match cmp_lap(lap, elem_lap) {
                 std::cmp::Ordering::Equal => {
                     // The element is ready for reading on this lap.
                     // Try to claim the right to read to this element.
@@ -549,7 +587,7 @@ impl<T> Bounded<T> for MpmcBounded<T> {
                 },
                 std::cmp::Ordering::Greater => {
                     // The element is not yet written on the previous lap.
-                    if lap > elem.load_lap() {
+                    if cmp_lap(lap, elem.load_lap()) == std::cmp::Ordering::Greater {
                         return (elem, elem_lap, false);
                     }
                     // The element has already been written on this lap;
@@ -611,6 +649,6 @@ impl<T> Checker for MpmcBounded<T> {
     /// Check queue was closed.
     #[inline(always)]
     fn is_close(&self) -> bool {
-        (self.write_meta.load(Ordering::Relaxed) & MPMC_MASK_64) != 0
+        (self.write_meta.load(Ordering::Relaxed) & MPMC_CLOSED) != 0
     }
 }

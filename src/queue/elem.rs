@@ -74,6 +74,14 @@ impl<T> ElemArr<T> {
     }
 }
 
+#[cfg(test)]
+impl<T> ElemArr<T> {
+    /// Sets the lap of an empty slot, so tests can start a queue near a lap boundary.
+    pub(crate) fn set_lap(&mut self, lap: u32) {
+        *self.lap.get_mut() = lap;
+    }
+}
+
 impl<T> Drop for ElemArr<T> {
     /// Because [`MaybeUninit`] will not drop contained data, we need to manually drop.
     /// 
