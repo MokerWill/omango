@@ -51,8 +51,10 @@ impl<T> ElemArr<T> {
         unsafe { 
             self.msg.get().write(MaybeUninit::new(msg)); 
         }
-        // Make the element available for reading.
-        self.lap.store(lap, Ordering::Release);
+        // Make the element available for reading. SeqCst, not Release: the writer then loads the
+        // reader waker's `empty` flag, and that load must not be ordered before this store, or a
+        // reader that registers in between misses both the message and the wakeup.
+        self.lap.store(lap, Ordering::SeqCst);
     }
 
     #[inline(always)]
@@ -63,8 +65,9 @@ impl<T> ElemArr<T> {
             msg = self.msg.get().read().assume_init(); 
         }
 
-        // Make the element available for writing.
-        self.lap.store(lap, Ordering::Release);
+        // Make the element available for writing. SeqCst for the same reason as in `write`,
+        // with the writer waker.
+        self.lap.store(lap, Ordering::SeqCst);
         msg
     }
 
