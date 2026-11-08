@@ -71,6 +71,13 @@ pub fn bounded<T: Send>(size: u32) -> (BSender<T>, BReceiver<T>) {
     (BSender::new(queue.clone()), BReceiver::new(queue))
 }
 
+/// Same as [`bounded`], but the ring has already turned `lap / 2` times.
+#[cfg(test)]
+pub(crate) fn bounded_at_lap<T: Send>(size: u32, lap: u32) -> (BSender<T>, BReceiver<T>) {
+    let queue = Arc::new(UnsafeCell::new(MpmcBounded::starting_at_lap(size, lap)));
+    (BSender::new(queue.clone()), BReceiver::new(queue))
+}
+
 /// The sending side of a bounded queue.
 ///
 /// # Examples
@@ -817,6 +824,75 @@ mod test {
         for _ in 0..amt * nthreads {
             assert_eq!(rx.recv(), Ok(1));
         }
+    }
+
+    #[test]
+    fn stays_open_when_lap_reaches_bit_31() {
+        // Writer lap (1 << 31) - 2: one turn later the writer lap is 1 << 31, which used to be
+        // read as the closed flag.
+        let (tx, rx) = crate::queue::mpmc::bounded_at_lap::<u32>(2, (1 << 31) - 2);
+        for i in 0..8 {
+            tx.try_send(i).unwrap();
+            assert_eq!(rx.try_recv(), Ok(i));
+        }
+        assert!(!tx.is_close());
+
+        tx.close();
+        assert!(tx.is_close());
+        assert!(matches!(tx.try_send(9), Err(crate::error::TrySendError::Disconnected(9))));
+    }
+
+    #[test]
+    fn try_send_reports_full_when_lap_wraps() {
+        // Writer lap u32::MAX - 1 is the last turn before the lap wraps around u32. Filling
+        // the ring on that turn leaves the slot laps at u32::MAX while the writer lap wraps to 0.
+        let (tx, rx) = crate::queue::mpmc::bounded_at_lap::<u32>(2, u32::MAX - 1);
+        tx.try_send(1).unwrap();
+        tx.try_send(2).unwrap();
+
+        // A plain comparison of the laps makes try_send spin here until a receiver makes room,
+        // instead of returning Full.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let tx_t = tx.clone();
+        let thread = std::thread::spawn(move || {
+            let full = matches!(tx_t.try_send(3), Err(crate::error::TrySendError::Full(3)));
+            done_tx.send(full).unwrap();
+        });
+        let result = done_rx.recv_timeout(std::time::Duration::from_secs(5));
+        if result.is_err() {
+            // Let the spinning try_send finish, so the test fails instead of hanging.
+            let _ = rx.try_recv();
+        }
+        thread.join().unwrap();
+        assert_eq!(result, Ok(true), "try_send on a full queue must return Full at once");
+
+        // The queue keeps working after the wrap.
+        assert_eq!(rx.try_recv(), Ok(1));
+        assert_eq!(rx.try_recv(), Ok(2));
+        for i in 10..20 {
+            tx.try_send(i).unwrap();
+            assert_eq!(rx.try_recv(), Ok(i));
+        }
+    }
+
+    #[test]
+    fn close_keeps_queued_messages_and_length() {
+        let (tx, rx) = crate::queue::mpmc::bounded::<u32>(4);
+        tx.try_send(1).unwrap();
+        tx.try_send(2).unwrap();
+        let length = tx.length();
+
+        rx.close();
+        assert!(tx.is_close() && rx.is_close());
+        assert_eq!(tx.length(), length, "the closed flag is not part of the length");
+        assert!(matches!(tx.try_send(3), Err(crate::error::TrySendError::Disconnected(3))));
+        assert_eq!(rx.try_recv(), Ok(1));
+        assert_eq!(rx.try_recv(), Ok(2));
+        assert_eq!(rx.try_recv(), Err(crate::error::TryRecvError));
+
+        // Closing again changes nothing.
+        tx.close();
+        assert!(tx.is_close());
     }
 
     #[test]
