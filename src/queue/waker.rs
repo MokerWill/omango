@@ -81,19 +81,47 @@ impl Waiter {
     }
 
     /// Blocks the current thread until woken.
+    ///
+    /// The waiter is marked `PARKED` before the condition is checked. A notify that runs
+    /// after the check resets the mark to `UN_PARKED` (see [`Metadata::notify`]), so `wait`
+    /// returns at once instead of sleeping through it.
     pub(crate) fn sleep(&self, checker: &dyn Checker) -> State  {
         let atom = unsafe { &(*self.atom) };
         loop {
+            self.parked.swap(PARKED, Ordering::SeqCst);
             if unlikely(checker.is_close()) {
                 self.parked.store(UN_PARKED, Ordering::Release);
                 return State::Closed;
             }
-            if atom.load(Ordering::Acquire) != self.expected {
+            if atom.load(Ordering::SeqCst) != self.expected {
                 self.parked.store(UN_PARKED, Ordering::Release);
                 return State::Success;
             }
-            self.parked.store(PARKED, Ordering::Relaxed);
+            #[cfg(test)]
+            test_hook::pause_after_check();
             wait(&self.parked, PARKED);
+        }
+    }
+}
+
+/// Lets a test widen the gap between a waiter's last check and its `wait`, on one thread only.
+#[cfg(test)]
+pub(crate) mod test_hook {
+    use std::{cell::Cell, time::Duration};
+
+    thread_local! {
+        static PAUSE: Cell<Duration> = Cell::new(Duration::ZERO);
+    }
+
+    /// Makes every blocking call on the current thread pause for `d` after its last check.
+    pub(crate) fn set_pause_after_check(d: Duration) {
+        PAUSE.with(|p| p.set(d));
+    }
+
+    pub(super) fn pause_after_check() {
+        let d = PAUSE.with(|p| p.get());
+        if !d.is_zero() {
+            std::thread::sleep(d);
         }
     }
 }
@@ -145,11 +173,12 @@ impl Metadata {
         if likely(self.start < self.waiters.len()) {
             self.start += 1;
         }
-        // Prevents to lost wakeup.
+        // Reset the mark of every waiter, not only of those already asleep: a waiter that has
+        // marked itself but not reached `wait` yet must not sleep through this notify.
         for idx in 0..self.start {
             let waiter = self.waiters.get(idx).unwrap();
             unsafe {
-                if (*(*waiter)).parked.load(Ordering::Acquire) == PARKED {
+                if (*(*waiter)).parked.swap(UN_PARKED, Ordering::SeqCst) == PARKED {
                     wake_one(&(*(*waiter)).parked);
                 }
             }

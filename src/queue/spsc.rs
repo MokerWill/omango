@@ -780,6 +780,40 @@ mod test {
         thread.join().unwrap();
     }
 
+    /// Runs `blocked` on a thread whose blocking calls pause 100 ms after their last check
+    /// (the test hook in `waker.rs`), runs `unblock` 20 ms later on this thread, so it lands in
+    /// that gap, and returns what `blocked` returned, or `None` if it is still blocked 5 s later.
+    fn run_blocked<R: Send + 'static>(
+        blocked: impl FnOnce() -> R + Send + 'static,
+        unblock: impl FnOnce(),
+    ) -> Option<R> {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            crate::queue::waker::test_hook::set_pause_after_check(std::time::Duration::from_millis(100));
+            done_tx.send(blocked()).unwrap();
+        });
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        unblock();
+        done_rx.recv_timeout(std::time::Duration::from_secs(5)).ok()
+    }
+
+    #[test]
+    fn recv_is_woken_by_a_send_right_after_its_last_check() {
+        let (tx, rx) = crate::queue::spsc::bounded::<u32>(4);
+        let got = run_blocked(move || rx.recv(), || tx.send(7).unwrap());
+        assert_eq!(got, Some(Ok(7)), "recv slept through the send");
+    }
+
+    #[test]
+    fn send_is_woken_by_a_recv_right_after_its_last_check() {
+        let (tx, rx) = crate::queue::spsc::bounded::<u32>(1);
+        tx.send(1).unwrap();
+        let tx_t = tx.clone();
+        let sent = run_blocked(move || tx_t.send(2).is_ok(), || assert_eq!(rx.try_recv(), Ok(1)));
+        assert_eq!(sent, Some(true), "send slept through the recv that made room");
+        assert_eq!(rx.try_recv(), Ok(2));
+    }
+
     #[test]
     fn send_close_gets_none() {
         // Bounded.
