@@ -784,6 +784,7 @@ mod test {
     /// Runs `blocked` on a thread whose blocking calls pause 100 ms after their last check
     /// (the test hook in `waker.rs`), runs `unblock` 20 ms later on this thread, so it lands in
     /// that gap, and returns what `blocked` returned, or `None` if it is still blocked 5 s later.
+    #[cfg(test)]
     fn run_blocked<R: Send + 'static>(
         blocked: impl FnOnce() -> R + Send + 'static,
         unblock: impl FnOnce(),
