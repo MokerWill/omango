@@ -22,7 +22,7 @@ criterion = { version = "0.5.1", features = ["default", "stable"] }
 [dependencies]
 parking_lot = "0.12.3"
 omango-util = "0.1.6"
-omango-futex = "0.1.2"
+omango-futex = { git = "https://github.com/MokerWill/omango-futex.git", rev = "68df8b4c91c8f7659fe87e81e6f9378769f6de02" } # patched: re-checks the value in the macOS wait
 
 [[bench]]
 name = "bench_queue"
